@@ -2526,6 +2526,94 @@ def _resolve_use_tui(args) -> bool:
         return False
 
 
+def _prepare_automation_hard_exit_boundary(args: object) -> bool:
+    """Validate and bind governed automation before tool/plugin imports."""
+    if not bool(getattr(args, "automation_hard_exit", False)):
+        return False
+    if not getattr(args, "quiet", False) or not getattr(args, "query", None):
+        print(
+            "Error: --automation-hard-exit requires --quiet and a non-empty "
+            "--query.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    if getattr(args, "source", None) != "tool":
+        print(
+            "Error: --automation-hard-exit requires --source tool.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    if getattr(args, "yolo", False) or getattr(args, "accept_hooks", False):
+        print(
+            "Error: --automation-hard-exit forbids --yolo and --accept-hooks.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+    # Bind before _prepare_agent_startup can import tools.approval and freeze
+    # process-wide YOLO state. Do not erase operator policy; fail closed when
+    # an inherited process override would weaken or change this explicit mode.
+    conflicting_env = [
+        name
+        for name in (
+            "HERMES_YOLO_MODE",
+            "HERMES_ACCEPT_HOOKS",
+            "HERMES_EXEC_ASK",
+        )
+        if os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+    ]
+    if conflicting_env:
+        print(
+            "Error: --automation-hard-exit conflicts with inherited approval "
+            "or hook overrides.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    os.environ["HERMES_AUTOMATION_MODE"] = "1"
+    os.environ["HERMES_SESSION_SOURCE"] = "tool"
+    return True
+
+
+def _automation_hard_exit(exit_code: int) -> None:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+    try:
+        logging.shutdown()
+    except Exception:
+        pass
+    os._exit(exit_code)
+
+
+def _run_cli_with_automation_exit(cli_main, kwargs: dict, *, enabled: bool) -> None:
+    exit_code = 0
+    try:
+        cli_main(**kwargs)
+    except SystemExit as exc:
+        if not enabled:
+            raise
+        if exc.code is None:
+            exit_code = 0
+        elif isinstance(exc.code, int):
+            exit_code = exc.code
+        else:
+            print(exc.code, file=sys.stderr)
+            exit_code = 1
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        if not enabled:
+            raise SystemExit(1) from exc
+        exit_code = 1
+
+    if enabled:
+        # cli.main's single-query finally has completed session finalization,
+        # global resource cleanup, and active-lease release before control can
+        # reach here.
+        _automation_hard_exit(exit_code)
+
+
 def cmd_chat(args):
     """Run interactive chat CLI."""
     use_tui = _resolve_use_tui(args)
@@ -2677,6 +2765,8 @@ def cmd_chat(args):
         print("You can run 'hermes setup' at any time to configure.")
         sys.exit(1)
 
+    automation_hard_exit = _prepare_automation_hard_exit_boundary(args)
+
     # Start update check in background (runs while other init happens).
     # On Termux this imports rich/prompt_toolkit in the foreground and then
     # competes for CPU on single-core devices, so keep it opt-in there.
@@ -2713,6 +2803,7 @@ def cmd_chat(args):
     # authoritative site because it runs before tool imports freeze
     # _YOLO_MODE_FROZEN.  This redundant set is a safety net for callers
     # that invoke cmd_chat directly (e.g. subcommand dispatch).
+    _prepare_automation_hard_exit_boundary(args)
     if getattr(args, "yolo", False):
         os.environ["HERMES_YOLO_MODE"] = "1"
 
@@ -2781,11 +2872,9 @@ def cmd_chat(args):
     # Filter out None values
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
-    try:
-        cli_main(**kwargs)
-    except ValueError as e:
-        print(f"Error: {e}")
-        sys.exit(1)
+    _run_cli_with_automation_exit(
+        cli_main, kwargs, enabled=automation_hard_exit
+    )
 
 
 def cmd_gateway(args):
@@ -11001,6 +11090,7 @@ def _try_fast_chat_launch() -> bool:
     if getattr(args, "command", None) not in {None, "chat"}:
         return False
 
+    _prepare_automation_hard_exit_boundary(args)
     if getattr(args, "yolo", False):
         os.environ["HERMES_YOLO_MODE"] = "1"
     _prepare_agent_startup(args)
@@ -11075,6 +11165,7 @@ def _try_termux_fast_cli_launch() -> bool:
 
     if args.command in {None, "chat"}:
         _set_chat_arg_defaults(args)
+        _prepare_automation_hard_exit_boundary(args)
         interactive_prompt = not getattr(args, "query", None) and not getattr(args, "image", None)
         if interactive_prompt:
             # Bare Termux CLI should reach the prompt first and do agent-only
@@ -12743,6 +12834,7 @@ def main():
     # import time (PR #7994, security hardening against prompt-injection).
     # If the env var is set only later (e.g. inside cmd_chat), the frozen
     # value is already False and --yolo silently does nothing.
+    _prepare_automation_hard_exit_boundary(args)
     if getattr(args, "yolo", False):
         os.environ["HERMES_YOLO_MODE"] = "1"
 

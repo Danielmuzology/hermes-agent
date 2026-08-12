@@ -2949,6 +2949,8 @@ def is_approval_bypass_active_for_session(session_key: str) -> bool:
     This is the pure-bypass sub-expression only. Callers that also honor a
     hardline blocklist / permanent allowlist must check those separately.
     """
+    if env_var_enabled("HERMES_AUTOMATION_MODE"):
+        return False
     return (
         _YOLO_MODE_FROZEN
         or is_session_yolo_enabled(session_key)
@@ -3198,7 +3200,10 @@ def _run_approval_gate(
     # --yolo bypasses all approval prompts (session- or process-scoped).
     # Hardline blocks are handled by the caller BEFORE this gate, so yolo
     # here only skips the recoverable approval layer.
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
+    is_automation = env_var_enabled("HERMES_AUTOMATION_MODE")
+    if not is_automation and (
+        _YOLO_MODE_FROZEN or is_current_session_yolo_enabled()
+    ):
         return {"approved": True, "message": None}
 
     session_key = get_current_session_key()
@@ -3214,8 +3219,10 @@ def _run_approval_gate(
 
     is_cli = _is_interactive_cli()
     is_gateway = _is_gateway_approval_context()
+    if is_automation:
+        is_cli = False
 
-    if not is_cli and not is_gateway:
+    if not is_cli and not is_gateway and not is_automation:
         # Cron sessions: respect cron_mode config
         if _is_cron_approval_context():
             if _get_cron_approval_mode() == "deny":
@@ -3253,7 +3260,7 @@ def _run_approval_gate(
         )
         return {"approved": True, "message": None}
 
-    if is_gateway or env_var_enabled("HERMES_EXEC_ASK"):
+    if is_gateway or env_var_enabled("HERMES_EXEC_ASK") or is_automation:
         # Interactive gateway round-trip when a notify callback is
         # registered for this session (Discord/Telegram/Slack embed +
         # buttons, same mechanism as check_dangerous_command). Blocks the
@@ -3455,7 +3462,9 @@ def check_dangerous_command(command: str, env_type: str,
 
     # --yolo: bypass all approval prompts. Gateway /yolo is session-scoped;
     # CLI --yolo remains process-scoped via the env var for local use.
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
+    if not env_var_enabled("HERMES_AUTOMATION_MODE") and (
+        _YOLO_MODE_FROZEN or is_current_session_yolo_enabled()
+    ):
         return {"approved": True, "message": None}
 
     if _command_matches_permanent_allowlist(command):
@@ -3781,8 +3790,13 @@ def check_all_command_guards(command: str, env_type: str,
 
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
+    is_automation = env_var_enabled("HERMES_AUTOMATION_MODE")
     approval_mode = _get_approval_mode()
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
+    if not is_automation and (
+        _YOLO_MODE_FROZEN
+        or is_current_session_yolo_enabled()
+        or approval_mode == "off"
+    ):
         return {"approved": True, "message": None}
 
     if _command_matches_permanent_allowlist(command):
@@ -3794,7 +3808,7 @@ def check_all_command_guards(command: str, env_type: str,
 
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
     # flows, we do not block on approvals and we skip external guard work.
-    if not is_cli and not is_gateway and not is_ask:
+    if not is_cli and not is_gateway and not is_ask and not is_automation:
         # Cron sessions: respect cron_mode config
         if _is_cron_approval_context():
             if _get_cron_approval_mode() == "deny":
@@ -3960,7 +3974,9 @@ def check_all_command_guards(command: str, env_type: str,
             return {"approved": True, "message": None,
                     "smart_approved": True,
                     "description": combined_desc_for_llm}
-        elif verdict == "deny" and not (is_cli or is_gateway or is_ask):
+        elif verdict == "deny" and not (
+            is_cli or is_gateway or is_ask or is_automation
+        ):
             _record_denial(session_key)
             breaker_addendum = _denial_breaker_addendum(session_key)
             return {
@@ -3999,7 +4015,7 @@ def check_all_command_guards(command: str, env_type: str,
     # responds with /approve or /deny, mirroring the CLI's synchronous
     # input() flow.  The agent never sees "approval_required"; it either
     # gets the command output (approved) or a definitive "BLOCKED" message.
-    if is_gateway or is_ask:
+    if is_gateway or is_ask or is_automation:
         notify_cb = None
         with _lock:
             notify_cb = _gateway_notify_cbs.get(session_key)
@@ -4259,11 +4275,16 @@ def check_execute_code_guard(code: str, env_type: str,
 
     # --yolo or approvals.mode=off: bypass (session- or process-scoped).
     approval_mode = _get_approval_mode()
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
+    if not env_var_enabled("HERMES_AUTOMATION_MODE") and (
+        _YOLO_MODE_FROZEN
+        or is_current_session_yolo_enabled()
+        or approval_mode == "off"
+    ):
         return {"approved": True, "message": None}
 
     is_gateway = _is_gateway_approval_context()
     is_ask = env_var_enabled("HERMES_EXEC_ASK")
+    is_automation = env_var_enabled("HERMES_AUTOMATION_MODE")
 
     # Cron: no user is present to approve arbitrary code.
     if _is_cron_approval_context():
@@ -4290,7 +4311,7 @@ def check_execute_code_guard(code: str, env_type: str,
     #     (context now propagates into the RPC thread, #33057); a whole-script
     #     prompt would fire on every execute_code call.
     #   * Local non-interactive non-gateway: documented limitation above.
-    if not is_gateway and not is_ask:
+    if not is_gateway and not is_ask and not is_automation:
         return {"approved": True, "message": None}
 
     session_key = get_current_session_key()
@@ -4324,7 +4345,9 @@ def check_execute_code_guard(code: str, env_type: str,
                          session_key)
             return {"approved": True, "message": None,
                     "smart_approved": True, "description": description}
-        if verdict == "deny" and not (is_gateway or is_ask):
+        if verdict == "deny" and not (
+            is_gateway or is_ask or is_automation
+        ):
             _record_denial(session_key)
             breaker_addendum = _denial_breaker_addendum(session_key)
             return {
@@ -4483,6 +4506,13 @@ def request_elicitation_consent(
 
     Returns one of ``"accept" | "decline" | "cancel"``.
     """
+    if env_var_enabled("HERMES_AUTOMATION_MODE"):
+        # Governed automation has no human consent channel. Never fall
+        # through to CLI input() merely because quiet chat marks itself
+        # interactive for ordinary terminal behavior.
+        logger.warning("MCP elicitation requested in governed automation; declining")
+        return "decline"
+
     try:
         session_key = get_current_session_key()
     except Exception as exc:  # pragma: no cover -- defensive

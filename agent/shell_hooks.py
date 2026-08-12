@@ -978,6 +978,10 @@ def _resolve_effective_accept(
       2. ``HERMES_ACCEPT_HOOKS`` env var
       3. ``hooks_auto_accept: true`` in ``cli-config.yaml``
     """
+    if os.environ.get("HERMES_AUTOMATION_MODE", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }:
+        return False
     if accept_hooks_arg:
         return True
     env = os.environ.get("HERMES_ACCEPT_HOOKS", "").strip().lower()
