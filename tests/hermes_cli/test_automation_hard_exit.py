@@ -27,6 +27,7 @@ def _clean_automation_environment():
         "HERMES_EXEC_ASK",
         "HERMES_SAFE_MODE",
         "HERMES_IGNORE_USER_CONFIG",
+        "HERMES_IGNORE_RULES",
     )
     previous = {name: os.environ.get(name) for name in names}
     for name in names:
@@ -52,6 +53,7 @@ def _args(**overrides):
         "continue_last": None,
         "safe_mode": False,
         "ignore_user_config": False,
+        "ignore_rules": False,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -87,6 +89,7 @@ def test_parser_scopes_hard_exit_to_chat():
         {"continue_last": True},
         {"safe_mode": True},
         {"ignore_user_config": True},
+        {"ignore_rules": True},
     ],
 )
 def test_boundary_rejects_unsafe_or_interactive_shapes(monkeypatch, overrides):
@@ -111,6 +114,7 @@ def test_boundary_rejects_unsafe_or_interactive_shapes(monkeypatch, overrides):
         "HERMES_EXEC_ASK",
         "HERMES_SAFE_MODE",
         "HERMES_IGNORE_USER_CONFIG",
+        "HERMES_IGNORE_RULES",
     ],
 )
 def test_boundary_rejects_inherited_authority_overrides(monkeypatch, name):

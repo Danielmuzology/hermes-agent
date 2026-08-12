@@ -2549,10 +2549,12 @@ def _prepare_automation_hard_exit_boundary(args: object) -> bool:
         or getattr(args, "continue_last", None)
         or getattr(args, "safe_mode", False)
         or getattr(args, "ignore_user_config", False)
+        or getattr(args, "ignore_rules", False)
     ):
         print(
             "Error: --automation-hard-exit requires a fresh classic query "
-            "without TUI, resume, continue, safe mode, or ignored user config.",
+            "without TUI, resume, continue, safe mode, ignored user config, "
+            "or ignored instructions.",
             file=sys.stderr,
         )
         raise SystemExit(2)
@@ -2574,6 +2576,7 @@ def _prepare_automation_hard_exit_boundary(args: object) -> bool:
             "HERMES_EXEC_ASK",
             "HERMES_SAFE_MODE",
             "HERMES_IGNORE_USER_CONFIG",
+            "HERMES_IGNORE_RULES",
         )
         if os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
     ]
