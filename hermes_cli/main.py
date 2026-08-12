@@ -2543,6 +2543,19 @@ def _prepare_automation_hard_exit_boundary(args: object) -> bool:
             file=sys.stderr,
         )
         raise SystemExit(2)
+    if (
+        getattr(args, "tui", False)
+        or getattr(args, "resume", None)
+        or getattr(args, "continue_last", None)
+        or getattr(args, "safe_mode", False)
+        or getattr(args, "ignore_user_config", False)
+    ):
+        print(
+            "Error: --automation-hard-exit requires a fresh classic query "
+            "without TUI, resume, continue, safe mode, or ignored user config.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
     if getattr(args, "yolo", False) or getattr(args, "accept_hooks", False):
         print(
             "Error: --automation-hard-exit forbids --yolo and --accept-hooks.",
@@ -2559,6 +2572,8 @@ def _prepare_automation_hard_exit_boundary(args: object) -> bool:
             "HERMES_YOLO_MODE",
             "HERMES_ACCEPT_HOOKS",
             "HERMES_EXEC_ASK",
+            "HERMES_SAFE_MODE",
+            "HERMES_IGNORE_USER_CONFIG",
         )
         if os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
     ]
@@ -2601,9 +2616,17 @@ def _automation_hard_exit(exit_code: int) -> None:
 
 
 def _run_cli_with_automation_exit(cli_main, kwargs: dict, *, enabled: bool) -> None:
-    exit_code = 0
+    # A governed quiet query is contractually terminal: cli.main must raise
+    # SystemExit after its single-query finally. A normal return means the
+    # expected finalize/status boundary was skipped, so fail closed.
+    exit_code = 1 if enabled else 0
     try:
         cli_main(**kwargs)
+        if enabled:
+            print(
+                "Error: governed automation exited without a terminal status.",
+                file=sys.stderr,
+            )
     except SystemExit as exc:
         if not enabled:
             raise
@@ -2614,17 +2637,31 @@ def _run_cli_with_automation_exit(cli_main, kwargs: dict, *, enabled: bool) -> N
         else:
             print(exc.code, file=sys.stderr)
             exit_code = 1
-    except ValueError as exc:
-        print(f"Error: {exc}")
+    except KeyboardInterrupt:
         if not enabled:
+            raise
+        exit_code = 130
+    except ValueError as exc:
+        if not enabled:
+            print(f"Error: {exc}")
             raise SystemExit(1) from exc
+        print("Error: governed automation failed.", file=sys.stderr)
+        exit_code = 1
+    except BaseException:
+        if not enabled:
+            raise
+        print("Error: governed automation failed.", file=sys.stderr)
         exit_code = 1
 
     if enabled:
-        # cli.main's single-query finally has completed session finalization,
-        # global resource cleanup, and active-lease release before control can
-        # reach here.
-        _automation_hard_exit(exit_code)
+        # The normal SystemExit path has already completed cli.main's
+        # single-query finalization and active-lease release. This idempotent
+        # process-global cleanup is defense-in-depth for an exception raised
+        # before cli.main established that finally boundary.
+        try:
+            _cleanup_oneshot_runtime()
+        finally:
+            _automation_hard_exit(exit_code)
 
 
 def cmd_chat(args):

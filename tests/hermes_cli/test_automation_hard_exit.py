@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
+import textwrap
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +14,7 @@ from hermes_cli import main
 from tools import approval
 from tools import file_tools
 from agent import shell_hooks
+from hermes_state import SessionDB
 
 
 @pytest.fixture(autouse=True)
@@ -21,6 +25,8 @@ def _clean_automation_environment():
         "HERMES_YOLO_MODE",
         "HERMES_ACCEPT_HOOKS",
         "HERMES_EXEC_ASK",
+        "HERMES_SAFE_MODE",
+        "HERMES_IGNORE_USER_CONFIG",
     )
     previous = {name: os.environ.get(name) for name in names}
     for name in names:
@@ -41,6 +47,11 @@ def _args(**overrides):
         "source": "tool",
         "yolo": False,
         "accept_hooks": False,
+        "tui": False,
+        "resume": None,
+        "continue_last": None,
+        "safe_mode": False,
+        "ignore_user_config": False,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -71,6 +82,11 @@ def test_parser_scopes_hard_exit_to_chat():
         {"source": "cli"},
         {"yolo": True},
         {"accept_hooks": True},
+        {"tui": True},
+        {"resume": "prior-session"},
+        {"continue_last": True},
+        {"safe_mode": True},
+        {"ignore_user_config": True},
     ],
 )
 def test_boundary_rejects_unsafe_or_interactive_shapes(monkeypatch, overrides):
@@ -88,7 +104,14 @@ def test_boundary_rejects_unsafe_or_interactive_shapes(monkeypatch, overrides):
 
 
 @pytest.mark.parametrize(
-    "name", ["HERMES_YOLO_MODE", "HERMES_ACCEPT_HOOKS", "HERMES_EXEC_ASK"]
+    "name",
+    [
+        "HERMES_YOLO_MODE",
+        "HERMES_ACCEPT_HOOKS",
+        "HERMES_EXEC_ASK",
+        "HERMES_SAFE_MODE",
+        "HERMES_IGNORE_USER_CONFIG",
+    ],
 )
 def test_boundary_rejects_inherited_authority_overrides(monkeypatch, name):
     monkeypatch.setenv(name, "1")
@@ -113,6 +136,26 @@ def test_boundary_binds_fail_closed_mode_and_source_before_startup(monkeypatch):
     assert "HERMES_YOLO_MODE" not in os.environ
     assert "HERMES_ACCEPT_HOOKS" not in os.environ
     assert "HERMES_EXEC_ASK" not in os.environ
+
+
+def test_bound_source_is_persisted_on_the_exact_session_row(monkeypatch, tmp_path):
+    """The early boundary must survive the same DB write used by HermesCLI."""
+    monkeypatch.setattr(approval, "_get_approval_mode", lambda: "smart")
+    assert main._prepare_automation_hard_exit_boundary(_args()) is True
+
+    session_id = "automation-source-contract"
+    database = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        database.create_session(
+            session_id=session_id,
+            source=os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+        )
+        persisted = database.get_session(session_id)
+        assert persisted is not None
+        assert persisted["id"] == session_id
+        assert persisted["source"] == "tool"
+    finally:
+        database.close()
 
 
 @pytest.mark.parametrize("mode", ["manual", "off"])
@@ -208,6 +251,7 @@ def test_hard_exit_happens_after_cli_main_unwinds(monkeypatch):
         finally:
             events.extend(["finalize", "cleanup", "lease-release"])
 
+    monkeypatch.setattr(main, "_cleanup_oneshot_runtime", lambda: events.append("global-cleanup"))
     monkeypatch.setattr(main, "_automation_hard_exit", lambda code: events.append(("exit", code)))
     main._run_cli_with_automation_exit(fake_cli_main, {}, enabled=True)
     assert events == [
@@ -215,8 +259,72 @@ def test_hard_exit_happens_after_cli_main_unwinds(monkeypatch):
         "finalize",
         "cleanup",
         "lease-release",
+        "global-cleanup",
         ("exit", 0),
     ]
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected_code"),
+    [
+        ("return", 1),
+        ("system-exit", 0),
+        ("value-error", 1),
+        ("runtime-error", 1),
+        ("keyboard-interrupt", 130),
+    ],
+)
+def test_enabled_wrapper_hard_exits_in_real_subprocess(outcome, expected_code):
+    script = textwrap.dedent(
+        f"""
+        import sys
+        from hermes_cli import main
+
+        def fake_cli_main(**_kwargs):
+            outcome = {outcome!r}
+            if outcome == "return":
+                return None
+            if outcome == "system-exit":
+                print("FINAL_ONLY", flush=True)
+                raise SystemExit(0)
+            if outcome == "value-error":
+                raise ValueError("secret-value-must-not-escape")
+            if outcome == "runtime-error":
+                raise RuntimeError("secret-value-must-not-escape")
+            raise KeyboardInterrupt()
+
+        main._cleanup_oneshot_runtime = lambda: print(
+            "CLEANUP_COMPLETE", file=sys.stderr, flush=True
+        )
+        main._run_cli_with_automation_exit(fake_cli_main, {{}}, enabled=True)
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=os.fspath(main.PROJECT_ROOT),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+    assert completed.returncode == expected_code
+    assert completed.stdout == ("FINAL_ONLY\n" if outcome == "system-exit" else "")
+    assert "CLEANUP_COMPLETE" in completed.stderr
+    assert "secret-value-must-not-escape" not in completed.stdout
+    assert "secret-value-must-not-escape" not in completed.stderr
+
+
+def test_disabled_wrapper_preserves_legacy_return_and_value_error(monkeypatch, capsys):
+    assert main._run_cli_with_automation_exit(lambda **_: None, {}, enabled=False) is None
+
+    with pytest.raises(SystemExit) as exc:
+        main._run_cli_with_automation_exit(
+            lambda **_: (_ for _ in ()).throw(ValueError("legacy detail")),
+            {},
+            enabled=False,
+        )
+    assert exc.value.code == 1
+    assert capsys.readouterr().out == "Error: legacy detail\n"
 
 
 def test_automation_diagnostics_use_stderr_and_stdout_stays_result_only(
