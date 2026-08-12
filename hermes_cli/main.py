@@ -2635,7 +2635,7 @@ def _run_cli_with_automation_exit(cli_main, kwargs: dict, *, enabled: bool) -> N
         elif isinstance(exc.code, int):
             exit_code = exc.code
         else:
-            print(exc.code, file=sys.stderr)
+            print("Error: governed automation failed.", file=sys.stderr)
             exit_code = 1
     except KeyboardInterrupt:
         if not enabled:

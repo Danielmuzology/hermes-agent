@@ -269,6 +269,7 @@ def test_hard_exit_happens_after_cli_main_unwinds(monkeypatch):
     [
         ("return", 1),
         ("system-exit", 0),
+        ("system-exit-message", 1),
         ("value-error", 1),
         ("runtime-error", 1),
         ("keyboard-interrupt", 130),
@@ -287,6 +288,8 @@ def test_enabled_wrapper_hard_exits_in_real_subprocess(outcome, expected_code):
             if outcome == "system-exit":
                 print("FINAL_ONLY", flush=True)
                 raise SystemExit(0)
+            if outcome == "system-exit-message":
+                raise SystemExit("secret-value-must-not-escape")
             if outcome == "value-error":
                 raise ValueError("secret-value-must-not-escape")
             if outcome == "runtime-error":
