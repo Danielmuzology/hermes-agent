@@ -3145,6 +3145,11 @@ def _cprint(text: str):
     ``loop.call_soon_threadsafe``, which pauses the input area, prints
     the line above it, and redraws the prompt cleanly.
     """
+    if os.environ.get("HERMES_AUTOMATION_MODE", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }:
+        print(text, file=sys.stderr)
+        return
     _record_output_history(text)
 
     try:
@@ -4305,7 +4310,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             pass_session_id: Include the session ID in the agent's system prompt
         """
         # Initialize Rich console
-        self.console = Console()
+        self.console = Console(
+            stderr=os.environ.get("HERMES_AUTOMATION_MODE", "").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
         self.config = CLI_CONFIG
         self.compact = compact if compact is not None else CLI_CONFIG["display"].get("compact", False)
         # tool_progress: "off", "new", "all", "verbose" (from config.yaml display section)

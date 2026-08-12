@@ -4,6 +4,7 @@ import os
 from types import SimpleNamespace
 
 import pytest
+from rich.console import Console
 
 from hermes_cli._parser import build_top_level_parser
 from hermes_cli import main
@@ -216,3 +217,19 @@ def test_hard_exit_happens_after_cli_main_unwinds(monkeypatch):
         "lease-release",
         ("exit", 0),
     ]
+
+
+def test_automation_diagnostics_use_stderr_and_stdout_stays_result_only(
+    monkeypatch, capsys
+):
+    import cli
+
+    monkeypatch.setenv("HERMES_AUTOMATION_MODE", "1")
+    cli._cprint("scanner diagnostic")
+    console = Console(stderr=True, force_terminal=False)
+    console.print("toolset diagnostic")
+    print("FINAL_ONLY")
+    captured = capsys.readouterr()
+    assert captured.out == "FINAL_ONLY\n"
+    assert "scanner diagnostic" in captured.err
+    assert "toolset diagnostic" in captured.err
