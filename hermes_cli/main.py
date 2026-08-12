@@ -2571,6 +2571,19 @@ def _prepare_automation_hard_exit_boundary(args: object) -> bool:
         raise SystemExit(2)
     os.environ["HERMES_AUTOMATION_MODE"] = "1"
     os.environ["HERMES_SESSION_SOURCE"] = "tool"
+
+    # Governed unattended automation requires the auxiliary smart reviewer.
+    # Manual would create an unavailable human prompt; off would bypass it.
+    # Import only after inherited YOLO was rejected and before plugin/tool
+    # discovery, so a profile mismatch cannot start any work.
+    from tools.approval import _get_approval_mode
+
+    if _get_approval_mode() != "smart":
+        print(
+            "Error: --automation-hard-exit requires approvals.mode=smart.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
     return True
 
 

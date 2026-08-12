@@ -105,12 +105,21 @@ def test_boundary_binds_fail_closed_mode_and_source_before_startup(monkeypatch):
         "HERMES_SESSION_SOURCE",
     ):
         monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(approval, "_get_approval_mode", lambda: "smart")
     assert main._prepare_automation_hard_exit_boundary(_args()) is True
     assert os.environ["HERMES_AUTOMATION_MODE"] == "1"
     assert os.environ["HERMES_SESSION_SOURCE"] == "tool"
     assert "HERMES_YOLO_MODE" not in os.environ
     assert "HERMES_ACCEPT_HOOKS" not in os.environ
     assert "HERMES_EXEC_ASK" not in os.environ
+
+
+@pytest.mark.parametrize("mode", ["manual", "off"])
+def test_boundary_requires_smart_profile_policy(monkeypatch, mode):
+    monkeypatch.setattr(approval, "_get_approval_mode", lambda: mode)
+    with pytest.raises(SystemExit) as exc:
+        main._prepare_automation_hard_exit_boundary(_args())
+    assert exc.value.code == 2
 
 
 def _prepare_approval(monkeypatch, verdict: str):
