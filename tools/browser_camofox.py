@@ -1082,6 +1082,8 @@ def camofox_vision(
             return blocked
 
         stats_before: Optional[Dict[str, Any]] = None
+        capture_id: Optional[str] = None
+        source_url: Optional[str] = None
         if requested_viewport is not None:
             stats_path = f"/tabs/{session['tab_id']}/stats"
             stats_params = {"userId": session["user_id"]}
@@ -1141,11 +1143,33 @@ def camofox_vision(
                     "viewport; no screenshot was captured"
                 )
 
+            capture_id_value = receipt.get("captureId")
+            if (
+                not isinstance(capture_id_value, str)
+                or len(capture_id_value) != 32
+                or any(character not in "0123456789abcdef" for character in capture_id_value)
+            ):
+                raise ValueError(
+                    "Camofox exact viewport receipt did not include a valid capture ID; "
+                    "no screenshot was captured"
+                )
+            source_url_value = receipt.get("sourceUrl")
+            if source_url_value != stats_before["url"]:
+                raise ValueError(
+                    "Camofox exact viewport receipt source URL did not match the "
+                    "pre-capture tab URL; no screenshot was captured"
+                )
+            capture_id = capture_id_value
+            source_url = source_url_value
+
         # Get screenshot as binary PNG
+        screenshot_params = {"userId": session["user_id"]}
+        if capture_id is not None:
+            screenshot_params["exactCaptureId"] = capture_id
         try:
             resp = _get_raw(
                 f"/tabs/{session['tab_id']}/screenshot",
-                params={"userId": session["user_id"]},
+                params=screenshot_params,
             )
         except Exception as exc:
             if requested_viewport is not None:
@@ -1159,6 +1183,8 @@ def camofox_vision(
         if requested_viewport is not None:
             assert stats_before is not None
             assert captured_at is not None
+            assert capture_id is not None
+            assert source_url is not None
             try:
                 raw_stats_after = _get(stats_path, params=stats_params)
             except Exception as exc:
@@ -1215,6 +1241,8 @@ def camofox_vision(
                 "screenshot_sha256": hashlib.sha256(screenshot_bytes).hexdigest(),
                 "captured_at": captured_at,
                 "url": _sanitized_evidence_url(stats_after["url"]),
+                "capture_id": capture_id,
+                "source_url": _sanitized_evidence_url(source_url),
                 "identifiers": identifiers,
                 "stats_stability": stats_stability,
             }

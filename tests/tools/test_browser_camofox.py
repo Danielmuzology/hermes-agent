@@ -93,11 +93,16 @@ def _vision_response(text="Camofox screenshot analysis"):
     return response
 
 
-def _exact_viewport_receipt():
+_EXACT_CAPTURE_ID = "0123456789abcdef0123456789abcdef"
+
+
+def _exact_viewport_receipt(source_url="https://example.com"):
     return {
         "ok": True,
         "width": 390,
         "height": 844,
+        "captureId": _EXACT_CAPTURE_ID,
+        "sourceUrl": source_url,
         "layoutViewport": {
             "width": 390,
             "height": 844,
@@ -440,7 +445,7 @@ class TestCamofoxExactViewport:
             patch("tools.browser_camofox._get", side_effect=[stats_before, stats_after]) as mock_get,
             patch(
                 "tools.browser_camofox._post",
-                return_value=_exact_viewport_receipt(),
+                return_value=_exact_viewport_receipt(stats_before["url"]),
             ) as mock_post,
             patch("tools.browser_camofox._get_raw", return_value=raw_response) as mock_get_raw,
             patch("tools.browser_camofox.load_config", return_value={}),
@@ -472,6 +477,8 @@ class TestCamofoxExactViewport:
         assert evidence["screenshot_sha256"] == hashlib.sha256(png).hexdigest()
         assert evidence["captured_at"].endswith("Z")
         assert evidence["url"] == "https://example.com/dashboard?token=***&view=full"
+        assert evidence["capture_id"] == _EXACT_CAPTURE_ID
+        assert evidence["source_url"] == "https://example.com/dashboard?token=***&view=full"
         assert evidence["identifiers"] == {
             "tab_id": "tab_exact",
             "user_id": "uiux-assistant",
@@ -493,7 +500,10 @@ class TestCamofoxExactViewport:
         )
         mock_get_raw.assert_called_once_with(
             "/tabs/tab_exact/screenshot",
-            params={"userId": "uiux-assistant"},
+            params={
+                "userId": "uiux-assistant",
+                "exactCaptureId": _EXACT_CAPTURE_ID,
+            },
         )
 
     def test_secret_shaped_session_identifiers_are_omitted(self):
@@ -576,9 +586,11 @@ class TestCamofoxExactViewport:
         ],
     )
     def test_layout_viewport_must_be_present_and_exact(self, layout_viewport):
-        receipt = {"ok": True, "width": 390, "height": 844}
+        receipt = _exact_viewport_receipt()
         if layout_viewport is not None:
             receipt["layoutViewport"] = layout_viewport
+        else:
+            receipt.pop("layoutViewport")
         stats = {"tabId": "tab_exact", "url": "https://example.com"}
         with (
             patch("tools.browser_camofox._get_session", return_value=self.SESSION),
@@ -598,6 +610,71 @@ class TestCamofoxExactViewport:
 
         assert result["success"] is False
         assert "CSS layout viewport" in result["error"]
+        mock_get_raw.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "capture_id",
+        [
+            None,
+            "",
+            "0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0",
+            "0123456789ABCDEF0123456789ABCDEF",
+            "g123456789abcdef0123456789abcdef",
+            123,
+        ],
+        ids=["missing", "empty", "short", "long", "uppercase", "non-hex", "non-string"],
+    )
+    def test_capture_id_must_be_exact_lowercase_hex(self, capture_id):
+        receipt = _exact_viewport_receipt()
+        if capture_id is None:
+            receipt.pop("captureId")
+        else:
+            receipt["captureId"] = capture_id
+        stats = {"tabId": "tab_exact", "url": "https://example.com"}
+        with (
+            patch("tools.browser_camofox._get_session", return_value=self.SESSION),
+            patch("tools.browser_camofox._camofox_private_page_block", return_value=None),
+            patch("tools.browser_camofox._get", return_value=stats),
+            patch("tools.browser_camofox._post", return_value=receipt),
+            patch("tools.browser_camofox._get_raw") as mock_get_raw,
+        ):
+            result = json.loads(
+                camofox_vision(
+                    "inspect",
+                    task_id="invalid-capture-id",
+                    viewport_width=390,
+                    viewport_height=844,
+                )
+            )
+
+        assert result["success"] is False
+        assert "valid capture ID" in result["error"]
+        mock_get_raw.assert_not_called()
+
+    def test_receipt_source_url_must_match_pre_capture_stats(self):
+        stats = {"tabId": "tab_exact", "url": "https://example.com/dashboard"}
+        with (
+            patch("tools.browser_camofox._get_session", return_value=self.SESSION),
+            patch("tools.browser_camofox._camofox_private_page_block", return_value=None),
+            patch("tools.browser_camofox._get", return_value=stats),
+            patch(
+                "tools.browser_camofox._post",
+                return_value=_exact_viewport_receipt("https://example.com/other"),
+            ),
+            patch("tools.browser_camofox._get_raw") as mock_get_raw,
+        ):
+            result = json.loads(
+                camofox_vision(
+                    "inspect",
+                    task_id="source-url-mismatch",
+                    viewport_width=390,
+                    viewport_height=844,
+                )
+            )
+
+        assert result["success"] is False
+        assert "source URL did not match" in result["error"]
         mock_get_raw.assert_not_called()
 
     def test_png_dimension_mismatch_fails_closed(self):
@@ -708,7 +785,7 @@ class TestCamofoxExactViewport:
             patch("tools.browser_camofox._get", side_effect=[stats_before, stats_after]),
             patch(
                 "tools.browser_camofox._post",
-                return_value=_exact_viewport_receipt(),
+                return_value=_exact_viewport_receipt(stats_before["url"]),
             ),
             patch("tools.browser_camofox._get_raw", return_value=raw_response),
             patch("agent.auxiliary_client.call_llm") as mock_llm,
