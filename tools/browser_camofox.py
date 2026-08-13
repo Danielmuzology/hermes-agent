@@ -34,6 +34,7 @@ import os
 import struct
 import threading
 import uuid
+import zlib
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 from urllib.parse import SplitResult, urlsplit, urlunsplit
@@ -531,18 +532,97 @@ def _png_bytes_from_screenshot_response(resp: requests.Response) -> bytes:
 
 
 def _png_ihdr_dimensions(png: bytes) -> tuple[int, int]:
-    """Return dimensions from the PNG IHDR chunk, rejecting malformed data."""
-    if (
-        len(png) < 33
-        or not png.startswith(_PNG_SIGNATURE)
-        or struct.unpack(">I", png[8:12])[0] != 13
-        or png[12:16] != b"IHDR"
-    ):
-        raise ValueError("Camofox screenshot had an invalid PNG IHDR header")
-    width, height = struct.unpack(">II", png[16:24])
-    if width <= 0 or height <= 0:
-        raise ValueError("Camofox screenshot reported invalid PNG dimensions")
-    return width, height
+    """Return PNG dimensions after validating the complete PNG container.
+
+    Exact viewport evidence must be a complete image, not merely a payload that
+    starts with a PNG signature and a plausible IHDR.  Keep this stdlib-only so
+    the browser integration does not depend on Pillow being installed.
+    """
+    if not png.startswith(_PNG_SIGNATURE):
+        raise ValueError("Camofox screenshot had an invalid PNG signature")
+
+    offset = len(_PNG_SIGNATURE)
+    width = height = 0
+    color_type: Optional[int] = None
+    saw_idat = False
+    idat_ended = False
+    saw_plte = False
+    chunk_index = 0
+
+    while offset < len(png):
+        # Length, type, and CRC require twelve bytes before any chunk payload.
+        if len(png) - offset < 12:
+            raise ValueError("Camofox screenshot had truncated PNG chunk framing")
+        length = struct.unpack(">I", png[offset : offset + 4])[0]
+        chunk_type = png[offset + 4 : offset + 8]
+        data_start = offset + 8
+        data_end = data_start + length
+        chunk_end = data_end + 4
+        if chunk_end > len(png):
+            raise ValueError("Camofox screenshot had a truncated PNG chunk")
+        if (
+            len(chunk_type) != 4
+            or not all(65 <= byte <= 90 or 97 <= byte <= 122 for byte in chunk_type)
+            # PNG's third chunk-type byte is reserved and must be uppercase.
+            or chunk_type[2] & 0x20
+        ):
+            raise ValueError("Camofox screenshot had an invalid PNG chunk type")
+
+        data = png[data_start:data_end]
+        expected_crc = struct.unpack(">I", png[data_end:chunk_end])[0]
+        actual_crc = zlib.crc32(data, zlib.crc32(chunk_type)) & 0xFFFFFFFF
+        if actual_crc != expected_crc:
+            raise ValueError("Camofox screenshot had an invalid PNG chunk CRC")
+
+        if chunk_index == 0:
+            if chunk_type != b"IHDR" or length != 13:
+                raise ValueError("Camofox screenshot had an invalid PNG IHDR header")
+            width, height = struct.unpack(">II", data[:8])
+            bit_depth, color_type, compression, image_filter, interlace = data[8:]
+            valid_bit_depths = {
+                0: {1, 2, 4, 8, 16},
+                2: {8, 16},
+                3: {1, 2, 4, 8},
+                4: {8, 16},
+                6: {8, 16},
+            }
+            if (
+                width <= 0
+                or height <= 0
+                or bit_depth not in valid_bit_depths.get(color_type, set())
+                or compression != 0
+                or image_filter != 0
+                or interlace not in (0, 1)
+            ):
+                raise ValueError("Camofox screenshot had invalid PNG IHDR values")
+        elif chunk_type == b"IHDR":
+            raise ValueError("Camofox screenshot had a duplicate PNG IHDR chunk")
+        elif chunk_type == b"PLTE":
+            if saw_idat or saw_plte or not 3 <= length <= 768 or length % 3:
+                raise ValueError("Camofox screenshot had an invalid PNG palette")
+            saw_plte = True
+        elif chunk_type == b"IDAT":
+            if idat_ended:
+                raise ValueError("Camofox screenshot had non-contiguous PNG IDAT chunks")
+            saw_idat = True
+        elif chunk_type == b"IEND":
+            if length != 0 or not saw_idat or (color_type == 3 and not saw_plte):
+                raise ValueError("Camofox screenshot had an invalid PNG ending")
+            if chunk_end != len(png):
+                raise ValueError("Camofox screenshot had trailing bytes after PNG IEND")
+            return width, height
+        else:
+            # Unknown critical chunks cannot be safely interpreted.  Ancillary
+            # chunks are permitted once their framing and CRC have been checked.
+            if not chunk_type[0] & 0x20:
+                raise ValueError("Camofox screenshot had an unknown critical PNG chunk")
+            if saw_idat:
+                idat_ended = True
+
+        offset = chunk_end
+        chunk_index += 1
+
+    raise ValueError("Camofox screenshot was missing a terminating PNG IEND chunk")
 
 
 def _safe_evidence_identifier(value: Any) -> Optional[str]:

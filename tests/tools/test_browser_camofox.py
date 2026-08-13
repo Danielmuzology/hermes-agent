@@ -3,6 +3,7 @@
 import hashlib
 import json
 import struct
+import zlib
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import MagicMock, patch
@@ -62,15 +63,25 @@ def _mock_response(status=200, json_data=None):
     return resp
 
 
+def _png_chunk(chunk_type, data):
+    return (
+        struct.pack(">I", len(data))
+        + chunk_type
+        + data
+        + struct.pack(">I", zlib.crc32(data, zlib.crc32(chunk_type)) & 0xFFFFFFFF)
+    )
+
+
 def _png_bytes(width, height):
-    """Return the minimum bytes needed for a structurally valid PNG IHDR."""
+    """Return a small, complete, valid RGBA PNG using only the stdlib."""
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+    # One filter byte plus transparent RGBA pixels per scanline.
+    image_data = zlib.compress((b"\x00" + b"\x00" * (width * 4)) * height)
     return (
         b"\x89PNG\r\n\x1a\n"
-        + struct.pack(">I", 13)
-        + b"IHDR"
-        + struct.pack(">II", width, height)
-        + b"\x08\x06\x00\x00\x00"
-        + b"\x00\x00\x00\x00"
+        + _png_chunk(b"IHDR", ihdr)
+        + _png_chunk(b"IDAT", image_data)
+        + _png_chunk(b"IEND", b"")
     )
 
 
@@ -616,6 +627,46 @@ class TestCamofoxExactViewport:
         assert result["success"] is False
         assert "PNG dimensions did not match" in result["error"]
         assert mock_get.call_count == 2
+        mock_llm.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "png",
+        [
+            b"\x89PNG\r\n\x1a\nnot-a-complete-chunk",
+            _png_bytes(390, 844)[:-1],
+            _png_bytes(390, 844)[:32] + b"\x01" + _png_bytes(390, 844)[33:],
+            _png_bytes(390, 844)[:-12],
+            _png_bytes(390, 844) + b"unexpected trailing bytes",
+        ],
+        ids=["fake-header", "truncated", "bad-crc", "missing-iend", "trailing-bytes"],
+    )
+    def test_malformed_png_evidence_fails_closed(self, png):
+        """Exact captures reject deceptive PNG-looking screenshot payloads."""
+        raw_response = MagicMock()
+        raw_response.content = png
+        stats = {"tabId": "tab_exact", "url": "https://example.com"}
+        with (
+            patch("tools.browser_camofox._get_session", return_value=self.SESSION),
+            patch("tools.browser_camofox._camofox_private_page_block", return_value=None),
+            patch("tools.browser_camofox._get", side_effect=[stats, stats]),
+            patch(
+                "tools.browser_camofox._post",
+                return_value=_exact_viewport_receipt(),
+            ),
+            patch("tools.browser_camofox._get_raw", return_value=raw_response),
+            patch("agent.auxiliary_client.call_llm") as mock_llm,
+        ):
+            result = json.loads(
+                camofox_vision(
+                    "inspect",
+                    task_id="malformed-png",
+                    viewport_width=390,
+                    viewport_height=844,
+                )
+            )
+
+        assert result["success"] is False
+        assert "PNG" in result["error"]
         mock_llm.assert_not_called()
 
     def test_non_png_response_fails_closed(self):
