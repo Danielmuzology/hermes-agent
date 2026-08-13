@@ -1978,7 +1978,7 @@ atexit.register(_stop_browser_cleanup_thread)
 # Tool Schemas
 # ============================================================================
 
-BROWSER_TOOL_SCHEMAS = [
+BROWSER_TOOL_SCHEMAS: List[Dict[str, Any]] = [
     {
         "name": "browser_navigate",
         "description": "Navigate to a URL in the browser. Initializes the session and loads the page. Must be called before other browser tools. For simple information retrieval, prefer web_search or web_extract (faster, cheaper). For plain-text endpoints — URLs ending in .md, .txt, .json, .yaml, .yml, .csv, .xml, raw.githubusercontent.com, or any documented API endpoint — prefer curl via the terminal tool or web_extract; the browser stack is overkill and much slower for these. Use browser tools when you need to interact with a page (click, fill forms, dynamic content). Returns a compact page snapshot with interactive elements and ref IDs — no need to call browser_snapshot separately after navigating.",
@@ -2101,6 +2101,18 @@ BROWSER_TOOL_SCHEMAS = [
                     "type": "boolean",
                     "default": False,
                     "description": "If true, overlay numbered [N] labels on interactive elements. Each [N] maps to ref @eN for subsequent browser commands. Useful for QA and spatial reasoning about page layout."
+                },
+                "viewport_width": {
+                    "type": "integer",
+                    "minimum": 100,
+                    "maximum": 4000,
+                    "description": "Optional exact Camofox CSS-layout and screenshot width in pixels. Must be provided together with viewport_height; omitted values preserve the current viewport."
+                },
+                "viewport_height": {
+                    "type": "integer",
+                    "minimum": 100,
+                    "maximum": 4000,
+                    "description": "Optional exact Camofox CSS-layout and screenshot height in pixels. Must be provided together with viewport_width; omitted values preserve the current viewport."
                 }
             },
             "required": ["question"]
@@ -4167,7 +4179,13 @@ def browser_get_images(task_id: Optional[str] = None) -> str:
         return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
 
 
-def browser_vision(question: str, annotate: bool = False, task_id: Optional[str] = None) -> Union[str, Dict[str, Any]]:
+def browser_vision(
+    question: str,
+    annotate: bool = False,
+    task_id: Optional[str] = None,
+    viewport_width: Optional[int] = None,
+    viewport_height: Optional[int] = None,
+) -> Union[str, Dict[str, Any]]:
     """
     Take a screenshot of the current page for visual inspection.
 
@@ -4185,6 +4203,10 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         question: What you want to know about the page visually
         annotate: If True, overlay numbered [N] labels on interactive elements
         task_id: Task identifier for session isolation
+        viewport_width: Exact Camofox capture width in pixels (100..4000).
+            Must be supplied together with viewport_height.
+        viewport_height: Exact Camofox capture height in pixels (100..4000).
+            Must be supplied together with viewport_width.
 
     Returns:
         A JSON string with vision analysis results and screenshot_path, or a
@@ -4192,7 +4214,22 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
     """
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_vision
-        return camofox_vision(question, annotate, task_id)
+        return camofox_vision(
+            question,
+            annotate,
+            task_id,
+            viewport_width=viewport_width,
+            viewport_height=viewport_height,
+        )
+
+    if viewport_width is not None or viewport_height is not None:
+        return json.dumps({
+            "success": False,
+            "error": (
+                "Exact viewport capture is available only with the Camofox "
+                "browser backend. No screenshot was captured."
+            ),
+        })
 
     import base64
     import uuid as uuid_mod
@@ -5084,7 +5121,13 @@ registry.register(
     name="browser_vision",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_vision"],
-    handler=lambda args, **kw: browser_vision(question=args.get("question", ""), annotate=args.get("annotate", False), task_id=kw.get("task_id")),
+    handler=lambda args, **kw: browser_vision(
+        question=args.get("question", ""),
+        annotate=args.get("annotate", False),
+        task_id=kw.get("task_id"),
+        viewport_width=args.get("viewport_width"),
+        viewport_height=args.get("viewport_height"),
+    ),
     check_fn=check_browser_vision_requirements,
     emoji="👁️",
 )

@@ -26,11 +26,15 @@ container as ``http://host.docker.internal:3000``.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
+import math
 import os
+import struct
 import threading
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
@@ -55,6 +59,10 @@ _vnc_url_checked = False  # only probe once per process
 # Cached command timeout from config (resolved lazily, like browser_tool)
 _cached_cmd_timeout: Optional[int] = None
 _cmd_timeout_resolved = False
+
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_VIEWPORT_MIN = 100
+_VIEWPORT_MAX = 4000
 
 
 def _get_command_timeout() -> int:
@@ -489,6 +497,138 @@ def _delete(path: str, body: dict = None, timeout: Optional[int] = None) -> dict
     return resp.json()
 
 
+def _validated_viewport(
+    viewport_width: Optional[int],
+    viewport_height: Optional[int],
+) -> Optional[tuple[int, int]]:
+    """Validate an optional exact viewport without coercing caller input."""
+    if viewport_width is None and viewport_height is None:
+        return None
+    if viewport_width is None or viewport_height is None:
+        raise ValueError(
+            "viewport_width and viewport_height must be provided together; "
+            "no screenshot was captured"
+        )
+
+    for name, value in (
+        ("viewport_width", viewport_width),
+        ("viewport_height", viewport_height),
+    ):
+        if type(value) is not int or not _VIEWPORT_MIN <= value <= _VIEWPORT_MAX:
+            raise ValueError(
+                f"{name} must be an integer from {_VIEWPORT_MIN} to "
+                f"{_VIEWPORT_MAX}; no screenshot was captured"
+            )
+    return viewport_width, viewport_height
+
+
+def _png_bytes_from_screenshot_response(resp: requests.Response) -> bytes:
+    """Require and return the raw PNG bytes served by Camofox."""
+    content = resp.content
+    if isinstance(content, bytes) and content.startswith(_PNG_SIGNATURE):
+        return content
+    raise ValueError("Camofox screenshot response was not a raw PNG")
+
+
+def _png_ihdr_dimensions(png: bytes) -> tuple[int, int]:
+    """Return dimensions from the PNG IHDR chunk, rejecting malformed data."""
+    if (
+        len(png) < 33
+        or not png.startswith(_PNG_SIGNATURE)
+        or struct.unpack(">I", png[8:12])[0] != 13
+        or png[12:16] != b"IHDR"
+    ):
+        raise ValueError("Camofox screenshot had an invalid PNG IHDR header")
+    width, height = struct.unpack(">II", png[16:24])
+    if width <= 0 or height <= 0:
+        raise ValueError("Camofox screenshot reported invalid PNG dimensions")
+    return width, height
+
+
+def _safe_evidence_identifier(value: Any) -> Optional[str]:
+    """Return a bounded identifier only when forced redaction leaves it intact."""
+    if not isinstance(value, str) or not value or len(value) > 256:
+        return None
+    from agent.redact import redact_sensitive_text
+
+    redacted = redact_sensitive_text(
+        value,
+        force=True,
+        redact_url_credentials=True,
+    )
+    return value if redacted == value else None
+
+
+def _sanitized_evidence_url(value: Any) -> str:
+    """Redact credentials from a capture URL at the model-output boundary."""
+    from agent.redact import redact_sensitive_text
+
+    return redact_sensitive_text(
+        str(value or ""),
+        force=True,
+        redact_url_credentials=True,
+    )
+
+
+def _require_capture_stats(data: Any, expected_tab_id: str) -> Dict[str, Any]:
+    """Validate the stable identity fields required for exact capture proof."""
+    if not isinstance(data, dict):
+        raise ValueError("Camofox tab stats response was not an object")
+    if data.get("tabId") != expected_tab_id:
+        raise ValueError("Camofox tab stats did not match the active tab")
+    if not isinstance(data.get("url"), str) or not data["url"]:
+        raise ValueError("Camofox tab stats did not include a URL")
+    return data
+
+
+def _capture_stats_projection(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Project Camofox stats into a small, secret-safe evidence record."""
+    projected: Dict[str, Any] = {"url": _sanitized_evidence_url(data.get("url"))}
+    tab_id = _safe_evidence_identifier(data.get("tabId"))
+    if tab_id is not None:
+        projected["tab_id"] = tab_id
+
+    for source_key, result_key in (
+        ("toolCalls", "tool_calls"),
+        ("downloadCount", "download_count"),
+        ("downloadsCount", "download_count"),
+        ("consecutiveFailures", "consecutive_failures"),
+        ("refsCount", "refs_count"),
+    ):
+        value = data.get(source_key)
+        if type(value) is int and result_key not in projected:
+            projected[result_key] = value
+    visited_urls = data.get("visitedUrls")
+    if isinstance(visited_urls, list):
+        projected["visited_url_count"] = len(visited_urls)
+    return projected
+
+
+def _stats_stability_evidence(
+    before: Dict[str, Any],
+    after: Dict[str, Any],
+    expected_tab_id: str,
+) -> Dict[str, Any]:
+    """Build tab/URL stability evidence without returning visited URLs."""
+    checks = {
+        "tab_id_matches_request_before": before.get("tabId") == expected_tab_id,
+        "tab_id_matches_request_after": after.get("tabId") == expected_tab_id,
+        "tab_id_unchanged": before.get("tabId") == after.get("tabId"),
+        "url_unchanged": before.get("url") == after.get("url"),
+    }
+    result: Dict[str, Any] = {
+        "stable": all(checks.values()),
+        "checks": checks,
+        "before": _capture_stats_projection(before),
+        "after": _capture_stats_projection(after),
+    }
+    before_calls = before.get("toolCalls")
+    after_calls = after.get("toolCalls")
+    if type(before_calls) is int and type(after_calls) is int:
+        result["tool_calls_delta"] = after_calls - before_calls
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Tool implementations
 # ---------------------------------------------------------------------------
@@ -836,10 +976,23 @@ def camofox_get_images(task_id: Optional[str] = None) -> str:
         return tool_error(str(e), success=False)
 
 
-def camofox_vision(question: str, annotate: bool = False,
-                   task_id: Optional[str] = None) -> str:
-    """Take a screenshot and analyze it with vision AI via Camofox."""
+def camofox_vision(
+    question: str,
+    annotate: bool = False,
+    task_id: Optional[str] = None,
+    viewport_width: Optional[int] = None,
+    viewport_height: Optional[int] = None,
+) -> str:
+    """Take a screenshot and analyze it with vision AI via Camofox.
+
+    Supplying both viewport dimensions enables an exact-capture protocol:
+    resize acknowledgement, provider-reported CSS layout dimensions, tab/URL
+    stability probes, and PNG IHDR verification must all succeed before the
+    screenshot is persisted or sent to vision AI. Omitting both dimensions
+    preserves the existing capture path.
+    """
     try:
+        requested_viewport = _validated_viewport(viewport_width, viewport_height)
         session = _get_session(task_id)
         if not session["tab_id"]:
             return tool_error("No browser session. Call browser_navigate first.", success=False)
@@ -848,11 +1001,143 @@ def camofox_vision(question: str, annotate: bool = False,
         if blocked:
             return blocked
 
+        stats_before: Optional[Dict[str, Any]] = None
+        if requested_viewport is not None:
+            stats_path = f"/tabs/{session['tab_id']}/stats"
+            stats_params = {"userId": session["user_id"]}
+            try:
+                raw_stats_before = _get(stats_path, params=stats_params)
+            except Exception as exc:
+                raise ValueError(
+                    "Could not obtain Camofox tab stats before exact capture"
+                ) from exc
+            stats_before = _require_capture_stats(raw_stats_before, session["tab_id"])
+
+            width, height = requested_viewport
+            try:
+                receipt = _post(
+                    f"/tabs/{session['tab_id']}/viewport",
+                    {
+                        "userId": session["user_id"],
+                        "width": width,
+                        "height": height,
+                    },
+                )
+            except Exception as exc:
+                raise ValueError(
+                    "Camofox exact viewport request failed; no screenshot was captured"
+                ) from exc
+            if (
+                not isinstance(receipt, dict)
+                or receipt.get("ok") is not True
+                or type(receipt.get("width")) is not int
+                or type(receipt.get("height")) is not int
+                or receipt["width"] != width
+                or receipt["height"] != height
+            ):
+                raise ValueError(
+                    "Camofox did not acknowledge the exact requested viewport; "
+                    "no screenshot was captured"
+                )
+            layout_viewport = receipt.get("layoutViewport")
+            device_pixel_ratio = (
+                layout_viewport.get("devicePixelRatio")
+                if isinstance(layout_viewport, dict)
+                else None
+            )
+            if (
+                not isinstance(layout_viewport, dict)
+                or type(layout_viewport.get("width")) is not int
+                or type(layout_viewport.get("height")) is not int
+                or layout_viewport["width"] != width
+                or layout_viewport["height"] != height
+                or isinstance(device_pixel_ratio, bool)
+                or not isinstance(device_pixel_ratio, (int, float))
+                or not math.isfinite(device_pixel_ratio)
+                or device_pixel_ratio <= 0
+            ):
+                raise ValueError(
+                    "Camofox did not prove the exact requested CSS layout "
+                    "viewport; no screenshot was captured"
+                )
+
         # Get screenshot as binary PNG
-        resp = _get_raw(
-            f"/tabs/{session['tab_id']}/screenshot",
-            params={"userId": session["user_id"]},
-        )
+        try:
+            resp = _get_raw(
+                f"/tabs/{session['tab_id']}/screenshot",
+                params={"userId": session["user_id"]},
+            )
+        except Exception as exc:
+            if requested_viewport is not None:
+                raise ValueError("Camofox exact screenshot capture failed") from exc
+            raise
+        captured_at = None
+        if requested_viewport is not None:
+            captured_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        screenshot_bytes = resp.content
+        capture_evidence: Optional[Dict[str, Any]] = None
+        if requested_viewport is not None:
+            assert stats_before is not None
+            assert captured_at is not None
+            try:
+                raw_stats_after = _get(stats_path, params=stats_params)
+            except Exception as exc:
+                raise ValueError(
+                    "Could not obtain Camofox tab stats after exact capture"
+                ) from exc
+            stats_after = _require_capture_stats(raw_stats_after, session["tab_id"])
+            stats_stability = _stats_stability_evidence(
+                stats_before,
+                stats_after,
+                session["tab_id"],
+            )
+            if not stats_stability["stable"]:
+                raise ValueError(
+                    "Camofox tab identity or URL changed during exact viewport "
+                    "capture; the screenshot was rejected"
+                )
+
+            screenshot_bytes = _png_bytes_from_screenshot_response(resp)
+            actual_width, actual_height = _png_ihdr_dimensions(screenshot_bytes)
+            requested_width, requested_height = requested_viewport
+            if (actual_width, actual_height) != requested_viewport:
+                raise ValueError(
+                    "Camofox screenshot PNG dimensions did not match the exact "
+                    "requested viewport"
+                )
+
+            identifiers = {}
+            for name, value in (
+                ("tab_id", session.get("tab_id")),
+                ("user_id", session.get("user_id")),
+                ("session_key", session.get("session_key")),
+            ):
+                safe_value = _safe_evidence_identifier(value)
+                if safe_value is not None:
+                    identifiers[name] = safe_value
+
+            capture_evidence = {
+                "requested_viewport": {
+                    "width": requested_width,
+                    "height": requested_height,
+                },
+                "actual_viewport": {
+                    "width": layout_viewport["width"],
+                    "height": layout_viewport["height"],
+                    "device_pixel_ratio": device_pixel_ratio,
+                    "source": "provider_layout_viewport",
+                },
+                "screenshot_dimensions": {
+                    "width": actual_width,
+                    "height": actual_height,
+                    "source": "png_ihdr",
+                },
+                "screenshot_sha256": hashlib.sha256(screenshot_bytes).hexdigest(),
+                "captured_at": captured_at,
+                "url": _sanitized_evidence_url(stats_after["url"]),
+                "identifiers": identifiers,
+                "stats_stability": stats_stability,
+            }
 
         # Save screenshot to cache
         from hermes_constants import get_hermes_home
@@ -861,10 +1146,10 @@ def camofox_vision(question: str, annotate: bool = False,
         screenshot_path = str(screenshots_dir / f"browser_screenshot_{uuid.uuid4().hex[:8]}.png")
 
         with open(screenshot_path, "wb") as f:
-            f.write(resp.content)
+            f.write(screenshot_bytes)
 
         # Encode for vision LLM
-        img_b64 = base64.b64encode(resp.content).decode("utf-8")
+        img_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
 
         # Also get annotated snapshot if requested
         annotation_context = ""
@@ -924,11 +1209,15 @@ def camofox_vision(question: str, annotate: bool = False,
         from agent.redact import redact_sensitive_text
         analysis = redact_sensitive_text(analysis)
 
-        return json.dumps({
+        result: Dict[str, Any] = {
             "success": True,
             "analysis": analysis,
             "screenshot_path": screenshot_path,
-        })
+        }
+        if capture_evidence is not None:
+            capture_evidence["screenshot_path"] = screenshot_path
+            result["capture_evidence"] = capture_evidence
+        return json.dumps(result)
     except Exception as e:
         return tool_error(str(e), success=False)
 
@@ -948,6 +1237,3 @@ def camofox_console(clear: bool = False, task_id: Optional[str] = None) -> str:
         "note": "Console log capture is not available with the Camofox backend. "
                 "Use browser_snapshot or browser_vision to inspect page state.",
     })
-
-
-
