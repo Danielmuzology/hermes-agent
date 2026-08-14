@@ -64,6 +64,11 @@ _cmd_timeout_resolved = False
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _VIEWPORT_MIN = 100
 _VIEWPORT_MAX = 4000
+# The provider bounds exact viewport work at 50 seconds.  Keep the ordinary
+# browser command timeout for all other calls, but give this one transaction a
+# small response margin so a successful provider cleanup cannot be abandoned
+# at the default 30-second client boundary.
+_EXACT_VIEWPORT_POST_TIMEOUT_FLOOR = 60
 
 
 def _get_command_timeout() -> int:
@@ -1104,6 +1109,10 @@ def camofox_vision(
                         "width": width,
                         "height": height,
                     },
+                    timeout=max(
+                        _get_command_timeout(),
+                        _EXACT_VIEWPORT_POST_TIMEOUT_FLOOR,
+                    ),
                 )
             except Exception as exc:
                 raise ValueError(

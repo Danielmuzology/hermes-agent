@@ -425,7 +425,15 @@ class TestCamofoxExactViewport:
         assert message in result["error"]
         mock_session.assert_not_called()
 
-    def test_exact_capture_returns_verified_evidence(self):
+    @pytest.mark.parametrize(
+        ("command_timeout", "expected_viewport_timeout"),
+        [(30, 60), (75, 75)],
+    )
+    def test_exact_capture_returns_verified_evidence(
+        self,
+        command_timeout,
+        expected_viewport_timeout,
+    ):
         png = _png_bytes(390, 844)
         raw_response = MagicMock()
         raw_response.content = png
@@ -447,6 +455,10 @@ class TestCamofoxExactViewport:
                 "tools.browser_camofox._post",
                 return_value=_exact_viewport_receipt(stats_before["url"]),
             ) as mock_post,
+            patch(
+                "tools.browser_camofox._get_command_timeout",
+                return_value=command_timeout,
+            ),
             patch("tools.browser_camofox._get_raw", return_value=raw_response) as mock_get_raw,
             patch("tools.browser_camofox.load_config", return_value={}),
             patch("agent.auxiliary_client.call_llm", return_value=_vision_response()),
@@ -497,6 +509,7 @@ class TestCamofoxExactViewport:
         mock_post.assert_called_once_with(
             "/tabs/tab_exact/viewport",
             {"userId": "uiux-assistant", "width": 390, "height": 844},
+            timeout=expected_viewport_timeout,
         )
         mock_get_raw.assert_called_once_with(
             "/tabs/tab_exact/screenshot",
