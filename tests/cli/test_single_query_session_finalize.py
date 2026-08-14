@@ -201,3 +201,70 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
     assert ("claim", "cli", True) in calls
     assert ("run", "hello", []) in calls
     assert calls[-1] == ("finalize", "quiet-session")
+
+
+def test_quiet_single_query_suppresses_reasoning_and_prints_only_final_response(
+    monkeypatch, capsys
+):
+    import cli as cli_mod
+
+    final_response = "VERDICT: PASS\nThe final answer remains intact."
+    instances = []
+
+    class FakeCLI:
+        def __init__(self, **_kwargs):
+            self.provider = "test-provider"
+            self.model = "test-model"
+            self.session_id = "quiet-session"
+            self.conversation_history = []
+            self._active_agent_route_signature = "same-route"
+            self.agent = SimpleNamespace(
+                session_id="quiet-session",
+                platform="cli",
+                quiet_mode=False,
+                suppress_status_output=False,
+                stream_delta_callback=object(),
+                reasoning_callback=lambda _text: print(
+                    "┌─ Reasoning ─┐\nprivate reasoning\n└─────────────┘"
+                ),
+                tool_gen_callback=object(),
+            )
+            self.agent.run_conversation = self._run_conversation
+            instances.append(self)
+
+        def _run_conversation(self, *, user_message, conversation_history):
+            if self.agent.reasoning_callback:
+                self.agent.reasoning_callback("private reasoning")
+            return {"final_response": final_response}
+
+        def _claim_active_session(self, _surface, *, stderr=False):
+            return stderr
+
+        def _ensure_runtime_credentials(self):
+            return True
+
+        def _resolve_turn_agent_config(self, _effective_query):
+            return {
+                "signature": "same-route",
+                "model": None,
+                "runtime": None,
+                "request_overrides": None,
+            }
+
+        def _init_agent(self, **_kwargs):
+            return True
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_GOAL_MODE", raising=False)
+    monkeypatch.setattr(cli_mod, "HermesCLI", FakeCLI)
+    monkeypatch.setattr(cli_mod.atexit, "register", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli_mod, "_finalize_single_query", lambda _cli: None)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_mod.main(query="review the UI", quiet=True, toolsets="browser")
+
+    captured = capsys.readouterr()
+    assert exc_info.value.code == 0
+    assert captured.out == f"{final_response}\n"
+    assert "Reasoning" not in captured.out
+    assert instances[0].agent.reasoning_callback is None

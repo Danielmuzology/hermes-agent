@@ -18826,10 +18826,12 @@ def main(
                     ):
                         cli.agent.quiet_mode = True
                         cli.agent.suppress_status_output = True
-                        # Suppress streaming display callbacks so stdout stays
-                        # machine-readable (no styled "Hermes" box, no tool-gen
-                        # status lines).  The response is printed once below.
+                        # Suppress display callbacks so stdout stays
+                        # machine-readable (no styled "Hermes"/reasoning boxes
+                        # or tool-gen status lines). The response is printed once
+                        # below.
                         cli.agent.stream_delta_callback = None
+                        cli.agent.reasoning_callback = None
                         cli.agent.tool_gen_callback = None
                         try:
                             result = cli.agent.run_conversation(
