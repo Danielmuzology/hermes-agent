@@ -1,151 +1,135 @@
 ---
 name: codex
-description: "Delegate coding to OpenAI Codex CLI (features, PRs)."
-version: 1.0.1
-author: Hermes Agent
-license: MIT
-platforms: [linux, macos, windows]
+description: Use when Engineering Specialist C executes or reviews bounded coding work through the authenticated OpenAI Codex CLI. Covers safe invocation, worktrees, evidence capture, sandbox modes, and Manager handoff.
+version: 2.0.0
+compatibility: Marc Mac mini; requires Git and the authenticated ChatGPT.app Codex CLI exposed through ~/.local/bin/codex.
 metadata:
-  hermes:
-    tags: [Coding-Agent, Codex, OpenAI, Code-Review, Refactoring]
-    related_skills: [claude-code, hermes-agent]
+  author: Muzology
+  owner: specialist_c
 ---
 
-# Codex CLI
+# Codex engineering worker
 
-Delegate coding tasks to [Codex](https://github.com/openai/codex) via the Hermes terminal. Codex is OpenAI's autonomous coding agent CLI.
+Use this skill only from Marc Assistant's Engineering profile (`specialist_c`). Darwinsky's Manager owns the human conversation, scope, approvals, and final report. Engineering owns Codex invocation, worktree isolation, evidence, diff inspection, tests, and return-to-Manager handoff.
 
-## When to use
+## Provider boundary
 
-- Building features
-- Refactoring
-- PR reviews
-- Batch issue fixing
+- This Mac mini assistant uses OpenAI Codex OAuth. OpenRouter policy is VM-only and must not be applied here.
+- Hermes/Darwinsky authentication and standalone Codex CLI authentication are separate stores. Never copy, print, or merge auth files.
+- Never expose `~/.codex/auth.json`, `~/.hermes/auth.json`, `.env` files, request dumps, gateway sessions, peer-mailbox secrets, or credential bundles to Codex.
 
-Requires the codex CLI and a git repository.
+## Stable command
 
-## Prerequisites
+Use `/Users/marcagent/.local/bin/codex`. It resolves the signed binary embedded in ChatGPT.app without copying it out of the app bundle.
 
-- Codex installed: `npm install -g @openai/codex`
-- OpenAI auth configured: either `OPENAI_API_KEY` or Codex OAuth credentials
-  from the Codex CLI login flow
-- **Must run inside a git repository** — Codex refuses to run outside one
-- Use `pty=true` in terminal calls — Codex is an interactive terminal app
+Before first use in a session:
 
-For Hermes itself, `model.provider: openai-codex` uses Hermes-managed Codex
-OAuth from `~/.hermes/auth.json` after `hermes auth add openai-codex`. For the
-standalone Codex CLI, a valid CLI OAuth session may live under
-`~/.codex/auth.json`; do not treat a missing `OPENAI_API_KEY` alone as proof
-that Codex auth is missing.
-
-## One-Shot Tasks
-
-```
-terminal(command="codex exec 'Add dark mode toggle to settings'", workdir="~/project", pty=true)
+```bash
+/Users/marcagent/.local/bin/codex --version
+/Users/marcagent/.local/bin/codex login status
+/Users/marcagent/.local/bin/codex doctor --json
 ```
 
-For scratch work (Codex needs a git repo):
-```
-terminal(command="cd $(mktemp -d) && git init && codex exec 'Build a snake game in Python'", pty=true)
-```
+Report installed version and auth/doctor status without exposing tokens.
 
-## Background Mode (Long Tasks)
+## Required execution boundary
 
-```
-# Start in background with PTY
-terminal(command="codex exec --sandbox workspace-write 'Refactor the auth module'", workdir="~/project", background=true, pty=true)
-# Returns session_id
+1. Receive one Manager-approved engineering slice with repository, acceptance criteria, tests, and non-goals.
+2. Verify the repository is a Git worktree and record clean/dirty status.
+3. Refuse broad roots such as `~/.hermes`, `~/.codex`, employee profile/session directories, runtime request dumps, or secret stores.
+4. Use a dedicated branch/worktree for implementation. Parallel Codex runs require separate worktrees.
+5. Load repository `AGENTS.md` plus the applicable engineering/test skills.
+6. Invoke Codex with explicit working directory, sandbox, approval mode, JSONL events, and final-message file.
+7. Preserve `stderr`; never suppress diagnostic evidence.
+8. Independently inspect the diff and run the relevant tests after Codex exits.
+9. Do not commit, push, merge, deploy, publish, rotate credentials, or contact humans.
+10. Return a status package to Manager: scope, files changed, tests, Codex exit/events, risks, blockers, and recommendation.
 
-# Monitor progress
-process(action="poll", session_id="<id>")
-process(action="log", session_id="<id>")
+## Execution modes
 
-# Send input if Codex asks a question
-process(action="submit", session_id="<id>", data="yes")
+### Read-only inspection
 
-# Kill if needed
-process(action="kill", session_id="<id>")
-```
+Use for code review, repo analysis, planning, and deterministic canaries:
 
-## Key Flags
-
-| Flag | Effect |
-|------|--------|
-| `exec "prompt"` | One-shot execution, exits when done |
-| `--sandbox workspace-write` (`-s`) | Sandboxed but auto-approves file changes in the workspace (the recommended auto-build mode) |
-| `--dangerously-bypass-approvals-and-sandbox` | No sandbox, no approvals (fastest, most dangerous; `--yolo` still works as a hidden alias) |
-| `--sandbox danger-full-access` | No Codex sandbox; useful when the host service context breaks bubblewrap |
-
-> **Deprecated:** `--full-auto` still works but the live CLI warns to use `--sandbox workspace-write` instead.
-
-## Hermes Gateway Caveat
-
-When invoking the Codex CLI from a Hermes gateway/service context (for example,
-Telegram-driven agent sessions), Codex `workspace-write` sandboxing may fail even
-when the same command works in the user's interactive shell. A typical symptom is
-bubblewrap/user-namespace errors such as `setting up uid map: Permission denied`
-or `loopback: Failed RTM_NEWADDR: Operation not permitted`.
-
-In that context, prefer:
-
-```
-codex exec --sandbox danger-full-access "<task>"
+```bash
+/Users/marcagent/.local/bin/codex \
+  -C /absolute/repo \
+  --sandbox read-only \
+  --ask-for-approval never \
+  exec --ephemeral --json \
+  --output-last-message /absolute/evidence/final.md \
+  "<bounded request>" \
+  > /absolute/evidence/events.jsonl \
+  2> /absolute/evidence/stderr.log
 ```
 
-Use process boundaries as the safety layer instead: explicit `workdir`, clean git
-status before launch, narrow task prompts, `git diff` review, targeted tests, and
-human/agent confirmation before committing broad changes.
+No PTY is required for ordinary `codex exec` automation.
 
-## PR Reviews
+### Unattended workspace-write
 
-Clone to a temp directory for safe review:
+Use when all needed work fits inside the worktree and no interactive escalation is expected:
 
-```
-terminal(command="REVIEW=$(mktemp -d) && git clone https://github.com/user/repo.git $REVIEW && cd $REVIEW && gh pr checkout 42 && codex review --base origin/main", pty=true)
-```
-
-## Parallel Issue Fixing with Worktrees
-
-```
-# Create worktrees
-terminal(command="git worktree add -b fix/issue-78 /tmp/issue-78 main", workdir="~/project")
-terminal(command="git worktree add -b fix/issue-99 /tmp/issue-99 main", workdir="~/project")
-
-# Launch Codex in each
-terminal(command="codex --sandbox workspace-write exec 'Fix issue #78: <description>. Commit when done.'", workdir="/tmp/issue-78", background=true, pty=true)
-terminal(command="codex --sandbox workspace-write exec 'Fix issue #99: <description>. Commit when done.'", workdir="/tmp/issue-99", background=true, pty=true)
-
-# Monitor
-process(action="list")
-
-# After completion, push and create PRs
-terminal(command="cd /tmp/issue-78 && git push -u origin fix/issue-78")
-terminal(command="gh pr create --repo user/repo --head fix/issue-78 --title 'fix: ...' --body '...'")
-
-# Cleanup
-terminal(command="git worktree remove /tmp/issue-78", workdir="~/project")
+```bash
+/Users/marcagent/.local/bin/codex \
+  -C /absolute/worktree \
+  --sandbox workspace-write \
+  --ask-for-approval never \
+  exec --ephemeral --json \
+  --output-last-message /absolute/evidence/final.md \
+  "<one approved implementation slice>" \
+  > /absolute/evidence/events.jsonl \
+  2> /absolute/evidence/stderr.log
 ```
 
-## Batch PR Reviews
+`never` means out-of-bound actions fail and are returned to the model. It does not grant full access.
 
-```
-# Fetch all PR refs
-terminal(command="git fetch origin '+refs/pull/*/head:refs/remotes/origin/pr/*'", workdir="~/project")
+### Supervised approval mode
 
-# Review multiple PRs in parallel
-terminal(command="codex exec 'Review PR #86. git diff origin/main...origin/pr/86'", workdir="~/project", background=true, pty=true)
-terminal(command="codex exec 'Review PR #87. git diff origin/main...origin/pr/87'", workdir="~/project", background=true, pty=true)
+Use `--ask-for-approval on-request` only when a live supervisor can inspect and answer approvals through an interactive PTY. Never use it for unattended background automation.
 
-# Post results
-terminal(command="gh pr comment 86 --body '<review>'", workdir="~/project")
-```
+## Forbidden defaults
 
-## Rules
+- No `danger-full-access` or approval/sandbox bypass as a fallback.
+- No routine `--skip-git-repo-check` for real work.
+- No broad `--add-dir` grants.
+- No hidden stderr.
+- No automatic network expansion.
+- No automatic commit, push, PR, merge, deploy, or publication.
+- No direct access to Muzology production credentials or private runtime history.
 
-1. **Always use `pty=true`** — Codex is an interactive terminal app and hangs without a PTY
-2. **Git repo required** — Codex won't run outside a git directory. Use `mktemp -d && git init` for scratch
-3. **Use `exec` for one-shots** — `codex exec "prompt"` runs and exits cleanly
-4. **`--sandbox workspace-write` for building** — auto-approves changes within the sandbox (`--full-auto` is deprecated for this)
-5. **Background for long tasks** — use `background=true` and monitor with `process` tool
-6. **Don't interfere** — monitor with `poll`/`log`, be patient with long-running tasks
-7. **Parallel is fine** — run multiple Codex processes at once for batch work
+A sandbox failure is a diagnosis and blocker, not permission to remove the sandbox.
+
+## Evidence contract
+
+Every implementation run must preserve:
+
+- `command.json` with secrets excluded
+- `version.txt`
+- `git-before.txt`
+- `events.jsonl`
+- `stderr.log`
+- `final.md`
+- `git-after.txt`
+- `diff.patch`
+- `result.json`
+
+Use `scripts/run-codex-bounded.sh` when possible. Read `references/official-codex-guidance-2026-08.md` for version-specific notes and primary sources.
+
+## Native Codex skills and AGENTS.md
+
+- Hermes skills tell Engineering how to supervise Codex.
+- Native Codex skills under `.agents/skills/` teach Codex repeated repository workflows.
+- Create a native Codex skill only after the workflow repeats and has stable acceptance criteria.
+- `AGENTS.md` owns repository invariants, architecture, approved commands, prohibited changes, and review requirements.
+- Do not assume Claude Code or other tools consume `AGENTS.md` identically; use thin tool-specific adapters when needed.
+
+## Verification
+
+Completion requires all of the following:
+
+- Codex exit code captured.
+- No `turn.failed` or `error` JSONL event.
+- Diff inspected independently.
+- Target tests run independently.
+- Unexpected changes reported and reverted only with Manager authorization.
+- Manager receives the evidence summary and decides the next action.
