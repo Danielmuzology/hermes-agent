@@ -85,6 +85,41 @@ class TestClassification:
         for name in BRIDGE_TOOL_NAMES:
             assert not is_deferrable_tool_name(name)
 
+    def test_peer_mailbox_control_plane_tools_never_defer(self):
+        """Mailbox send/read schemas must remain directly callable.
+
+        Some providers cannot populate the progressive-disclosure bridge's
+        nested ``arguments`` object.  Deferring these two tools would make an
+        otherwise healthy agent-to-agent route unusable.
+        """
+        from tools.tool_search import (
+            ALWAYS_VISIBLE_TOOL_NAMES,
+            is_deferrable_tool_name,
+        )
+
+        assert ALWAYS_VISIBLE_TOOL_NAMES == {
+            "mcp__employee_runtime__peer_mailbox_send",
+            "mcp__employee_runtime__peer_mailbox_get_thread",
+        }
+        for name in ALWAYS_VISIBLE_TOOL_NAMES:
+            assert not is_deferrable_tool_name(name)
+
+    def test_peer_mailbox_always_visible_names_are_exact(self, monkeypatch):
+        """A lookalike MCP tool must not inherit control-plane treatment."""
+        from tools import tool_search
+
+        class _Entry:
+            toolset = "mcp-employee-runtime"
+
+        monkeypatch.setattr(
+            "tools.registry.registry.get_entry",
+            lambda name: _Entry(),
+        )
+
+        assert tool_search.is_deferrable_tool_name(
+            "mcp__other_runtime__peer_mailbox_send"
+        )
+
     def test_unknown_tool_not_deferrable(self):
         """Defensive: a tool name we cannot resolve to a registry entry must
         not be claimed as deferrable. This protects against the OpenClaw
