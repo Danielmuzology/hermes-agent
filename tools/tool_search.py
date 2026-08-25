@@ -58,6 +58,17 @@ TOOL_CALL_NAME = "tool_call"
 
 BRIDGE_TOOL_NAMES = frozenset({TOOL_SEARCH_NAME, TOOL_DESCRIBE_NAME, TOOL_CALL_NAME})
 
+# Agent-to-agent mailbox primitives are control-plane communication tools, not
+# optional domain integrations.  Keep their schemas model-visible so providers
+# that cannot reliably populate the bridge's nested ``arguments`` object can
+# still send and read governed peer messages.  The full names are deliberately
+# exact: an unrelated MCP server cannot acquire always-visible treatment by
+# choosing a similar suffix.
+ALWAYS_VISIBLE_TOOL_NAMES = frozenset({
+    "mcp__employee_runtime__peer_mailbox_send",
+    "mcp__employee_runtime__peer_mailbox_get_thread",
+})
+
 # When estimating tokens from char count without a real tokenizer, this is
 # the cheap rule of thumb that's stable across providers. Roughly 4 chars
 # per token for English+JSON. Underestimating leads to false negatives
@@ -210,6 +221,8 @@ def is_deferrable_tool_name(name: str) -> bool:
     against accidental shadowing).
     """
     if name in BRIDGE_TOOL_NAMES:
+        return False
+    if name in ALWAYS_VISIBLE_TOOL_NAMES:
         return False
     if name in _core_tool_names():
         return False
